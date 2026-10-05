@@ -19,29 +19,7 @@ Modern Security Operations Centers (SOCs) contend with vast amounts of fragmente
 
 ## 🏗️ System Architecture
 
-```text
-       ┌────────────────────────┐
-       │   Raw Log Sources      │  (Syslog, JSON, Firewalls, Web Apps)
-       └───────────┬────────────┘
-                   │
-                   ▼
-       ┌────────────────────────┐
-       │     Vector Engine      │ ── Real-time OCSF Parsing & Remapping (VRL)
-       └───────────┬────────────┘
-                   │
-                   │ (Normalized OCSF Event Stream)
-                   ▼
-       ┌────────────────────────┐
-       │  ulpf-parquet-worker   │ ── High-throughput, Zero-GC Rust Service
-       └─────┬────────────┬─────┘
-             │            │
-             ▼            ▼
-┌──────────────────┐  ┌──────────────────────────┐
-│ Apache Parquet   │  │ Streamlit Management UI  │
-│ Columnar Storage │  │ (Pipeline Monitoring &   │
-│ (Archives)       │  │ Schema Remap Inspector) │
-└──────────────────┘  └──────────────────────────┘
-```
+![ULPF System Architecture](architecture.png)
 
 ---
 
