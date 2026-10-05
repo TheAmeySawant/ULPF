@@ -1,0 +1,219 @@
+services:
+  # 1. The Streaming Bus (Air-gap friendly Kafka alternative)
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    container_name: ulpf-streaming-bus
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:29092
+      - --advertise-kafka-addr=internal://ulpf-streaming-bus:9092,external://localhost:29092
+    ports:
+      - "9092:9092"
+      - "9644:9644"
+    networks:
+      - ulpf_net
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 2. The Raw & Normalized Data Lake
+  minio:
+    image: quay.io/minio/minio
+    container_name: ulpf-storage-lake
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD}"
+    ports:
+      - "9000:9000" # API Port
+      - "9001:9001" # Console Port
+    volumes:
+      - minio_data:/data
+    networks:
+      - ulpf_net
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # 3. The Analytics Database (ClickHouse with native Parquet support)
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: ulpf-clickhouse
+    environment:
+      CLICKHOUSE_USER: "${CLICKHOUSE_USER}"
+      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD}"
+    ports:
+      - "8123:8123"
+      - "9002:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    networks:
+      - ulpf_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # 4a. One-shot init: create the ClickHouse table if it doesn't exist yet
+  init-clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: ulpf-init-clickhouse
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    networks:
+      - ulpf_net
+    environment:
+      CLICKHOUSE_USER: "${CLICKHOUSE_USER}"
+      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD}"
+      CLICKHOUSE_DB: "${CLICKHOUSE_DB}"
+      CLICKHOUSE_TABLE: "${CLICKHOUSE_TABLE}"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        clickhouse-client --host ulpf-clickhouse \
+          --user "$$CLICKHOUSE_USER" --password "$$CLICKHOUSE_PASSWORD" -q "
+          CREATE DATABASE IF NOT EXISTS $$CLICKHOUSE_DB;
+          CREATE TABLE IF NOT EXISTS $$CLICKHOUSE_DB.$$CLICKHOUSE_TABLE (
+              schema_version String,
+              ulpf Tuple(
+                  event_uuid String,
+                  raw_log_pointer String,
+                  raw_log_hash String,
+                  ingestion_timestamp DateTime64(3, 'UTC'),
+                  parser_name String,
+                  parser_version String,
+                  parser_confidence Float32,
+                  normalization_status String
+              ),
+              class_uid UInt16,
+              class_name String,
+              category_uid UInt16,
+              category_name String,
+              activity_id UInt8,
+              activity_name String,
+              type_uid UInt32,
+              severity_id UInt8,
+              severity String,
+              time DateTime64(3, 'UTC'),
+              src_endpoint Tuple(ip String, port Nullable(UInt16), hostname Nullable(String), mac Nullable(String), interface_name Nullable(String)),
+              dst_endpoint Tuple(ip String, port Nullable(UInt16), hostname Nullable(String), interface_name Nullable(String)),
+              connection_info Tuple(protocol_name String, protocol_num UInt8, direction String, direction_id UInt8),
+              traffic Tuple(bytes_in UInt64, bytes_out UInt64, packets_in UInt64, packets_out UInt64),
+              metadata Tuple(version String, product Tuple(vendor_name String, name String, version String), log_name String, original_time DateTime64(3, 'UTC')),
+              unmapped String,
+              enrichments String,
+              raw_data String
+          ) ENGINE = MergeTree()
+          ORDER BY (time, class_uid);
+          "
+
+  # 4b. One-shot init: create the MinIO bucket if it doesn't exist yet
+  init-minio:
+    image: quay.io/minio/mc:latest
+    container_name: ulpf-init-minio
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - ulpf_net
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD}"
+      MINIO_BUCKET: "${MINIO_BUCKET}"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mc alias set local http://ulpf-storage-lake:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" &&
+        mc mb --ignore-existing local/$$MINIO_BUCKET
+
+  # 5. The Ingestion & Parsing Engine
+  vector:
+    build:
+      context: ./vector
+      dockerfile: Dockerfile
+    container_name: ulpf-ingestion-engine
+    env_file:
+      - .env
+    ports:
+      - "514:514/udp" # Standard Syslog
+      - "514:514/tcp"
+      - "8080-8089:8080-8089" # Exposed specifically for the UI's HTTP Webhook injections
+    volumes:
+      - ./vector/custom_parsers:/etc/vector/configs # Synchronized mount path for UI configs
+    command: ["--config-dir", "/etc/vector/configs", "--watch-config"] # Enables seamless hot-reloads
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      init-clickhouse:
+        condition: service_completed_successfully
+      init-minio:
+        condition: service_completed_successfully
+    networks:
+      - ulpf_net
+
+  # 6. The Parquet Micro-batch Worker
+  parquet-worker:
+    build:
+      context: ./ulpf-parquet-worker
+      dockerfile: Dockerfile
+    container_name: ulpf-parquet-worker
+    env_file:
+      - .env
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - ulpf_net
+
+  # 7. The SOC Visualization Dashboard
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ulpf-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - ulpf_net
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+
+  # 8. The Control Plane UI
+  ulpf-ui:
+    build: ./ui
+    container_name: ulpf-ui
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./vector/custom_parsers:/etc/vector/configs
+    networks:
+      - ulpf_net
+
+networks:
+  ulpf_net:
+    driver: bridge
+
+volumes:
+  minio_data:
+  clickhouse_data:
+  grafana_data:

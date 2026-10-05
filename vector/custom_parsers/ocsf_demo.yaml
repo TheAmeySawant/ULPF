@@ -1,0 +1,227 @@
+sources:
+  gen_web_allow:
+    type: demo_logs
+    format: syslog
+    interval: 0.004      # ~250 events/sec
+  gen_ssh_block_1:
+    type: demo_logs
+    format: syslog
+    interval: 0.008      # ~125/sec
+  gen_rdp_block_2:
+    type: demo_logs
+    format: syslog
+    interval: 0.012      # ~80/sec
+  gen_db_block_3:
+    type: demo_logs
+    format: syslog
+    interval: 0.025      # ~40/sec
+  gen_garbage:
+    type: demo_logs
+    format: syslog
+    interval: 0.1        # ~10/sec
+  gen_json:
+    type: demo_logs
+    format: syslog
+    interval: 0.2        # ~5/sec
+
+transforms:
+  # ---------------------------------------------------------
+  # STAGE 0: Inject Multi-Vector Scenarios
+  # ---------------------------------------------------------
+  inject_web_allow:
+    type: remap
+    inputs: [gen_web_allow]
+    source: |-
+      current_time = format_timestamp!(now(), "%Y-%m-%dT%H:%M:%SZ")
+      .message = "NTRO-CUSTOM-FW|v2.4|" + current_time + "|ALLOW|SRC:10.50.2.14|DST:192.168.1.10|PRT:443"
+
+  inject_ssh_block_1:
+    type: remap
+    inputs: [gen_ssh_block_1]
+    source: |-
+      current_time = format_timestamp!(now(), "%Y-%m-%dT%H:%M:%SZ")
+      .message = "NTRO-CUSTOM-FW|v2.4|" + current_time + "|BLOCK|SRC:114.119.130.178|DST:192.168.1.100|PRT:22"
+
+  inject_rdp_block_2:
+    type: remap
+    inputs: [gen_rdp_block_2]
+    source: |-
+      current_time = format_timestamp!(now(), "%Y-%m-%dT%H:%M:%SZ")
+      .message = "NTRO-CUSTOM-FW|v2.4|" + current_time + "|BLOCK|SRC:45.33.32.156|DST:192.168.1.100|PRT:3389"
+
+  inject_db_block_3:
+    type: remap
+    inputs: [gen_db_block_3]
+    source: |-
+      current_time = format_timestamp!(now(), "%Y-%m-%dT%H:%M:%SZ")
+      .message = "NTRO-CUSTOM-FW|v2.4|" + current_time + "|BLOCK|SRC:185.220.101.44|DST:192.168.1.50|PRT:1433"
+
+  inject_garbage_log:
+    type: remap
+    inputs: [gen_garbage]
+    source: |-
+      .message = "URGENT: The firewall is literally on fire, send help"
+
+  inject_bad_json:
+    type: remap
+    inputs: [gen_json]
+    source: |-
+      .message = "{\"threat_level\": \"midnight\", \"hacker_ip\": \"1.2.3.4\"}"
+
+  # ---------------------------------------------------------
+  # STAGE 1: Universal Tagging (Zero Data Loss)
+  # ---------------------------------------------------------
+  universal_tagging:
+    type: remap
+    inputs: [inject_web_allow, inject_ssh_block_1, inject_rdp_block_2, inject_db_block_3, inject_garbage_log, inject_bad_json]
+    source: |-
+      .ulpf.event_uuid = uuid_v4()
+      .ulpf.ingestion_timestamp = now()
+      date_str = format_timestamp!(.ulpf.ingestion_timestamp, "%Y-%m-%d")
+      # Hardcoded the raw-events bucket here to fix the variable mapping error
+      .ulpf.raw_log_pointer = "s3://raw-events/date=" + date_str + "/" + .ulpf.event_uuid + ".log.gz"
+      .raw_data = string!(.message)
+
+  # ---------------------------------------------------------
+  # STAGE 2: Format Decoder (Catch Structural Unknowns)
+  # ---------------------------------------------------------
+  format_decoder:
+    type: remap
+    inputs: [universal_tagging]
+    source: |-
+      raw = string!(.raw_data)
+
+      parsed_json = parse_json(raw) ?? null
+      parsed_cef = parse_cef(raw) ?? null
+      parsed_ntro = parse_regex(raw, r'^(?P<vendor>[^\|]+)\|(?P<version>[^\|]+)\|(?P<time>[^\|]+)\|(?P<action>[^\|]+)\|SRC:(?P<src_ip>[^\|]+)\|DST:(?P<dst_ip>[^\|]+)\|PRT:(?P<port>\d+)$') ?? null
+
+      if parsed_json != null {
+          .ulpf.detected_format = "json"
+          .parsed_payload = parsed_json
+      } else if parsed_cef != null {
+          .ulpf.detected_format = "cef"
+          .parsed_payload = parsed_cef
+      } else if parsed_ntro != null {
+          .ulpf.detected_format = "ntro_custom"
+          .parsed_payload = parsed_ntro
+      } else {
+          .ulpf.detected_format = "unknown"
+          .ulpf.normalization_status = "UNPARSED"
+      }
+
+  # ---------------------------------------------------------
+  # STAGE 3: Schema Mapper (Catch Semantic Unknowns)
+  # ---------------------------------------------------------
+  schema_mapper:
+    type: remap
+    inputs: [format_decoder]
+    source: |-
+      if .ulpf.normalization_status == "UNPARSED" {
+          del(.message)
+
+      } else if .ulpf.detected_format == "ntro_custom" {
+          .ulpf.normalization_status = "FULL"
+          .ulpf.raw_log_hash = "sha256:" + sha2(string!(.raw_data), variant: "SHA-256")
+          .ulpf.parser_name = "ntro_custom"
+          .ulpf.parser_version = "1.0.0"
+          .ulpf.parser_confidence = 0.98
+          .schema_version = "1.0.0"
+          .time = parse_timestamp!(.parsed_payload.time, format: "%+")
+
+          .class_uid = 4001
+          .class_name = "Network Activity"
+          .category_uid = 4
+          .category_name = "Network Activity"
+
+          if .parsed_payload.action == "BLOCK" {
+              .activity_id = 2
+              .activity_name = "Deny"
+              .type_uid = 400102
+              .severity_id = 3
+              .severity = "Critical"
+          } else {
+              .activity_id = 1
+              .activity_name = "Allow"
+              .type_uid = 400101
+              .severity_id = 1
+              .severity = "Informational"
+          }
+
+          .src_endpoint.ip = .parsed_payload.src_ip
+          .dst_endpoint.ip = .parsed_payload.dst_ip
+          .dst_endpoint.port = to_int(.parsed_payload.port) ?? null
+
+          .connection_info.protocol_name = "tcp"
+          .connection_info.direction = "Inbound"
+
+          .metadata.version = "1.1.0"
+          .metadata.product.vendor_name = "NTRO"
+          .metadata.product.name = "Custom-FW"
+          .metadata.product.version = .parsed_payload.version
+          .metadata.log_name = "syslog"
+          .metadata.original_time = .time
+
+          del(.parsed_payload)
+          del(.message)
+
+      } else {
+          .ulpf.normalization_status = "UNRECOGNIZED"
+          .unmapped = encode_json(.parsed_payload)
+          del(.parsed_payload)
+          del(.message)
+      }
+
+  # ---------------------------------------------------------
+  # STAGE 4: Traffic Cop (The Splitter)
+  # ---------------------------------------------------------
+  traffic_cop:
+    type: route
+    inputs: [schema_mapper]
+    route:
+      structured: '.ulpf.normalization_status == "FULL" || .ulpf.normalization_status == "PARTIAL"'
+      quarantine: '.ulpf.normalization_status == "UNPARSED" || .ulpf.normalization_status == "UNRECOGNIZED"'
+
+sinks:
+  minio_raw_archive:
+    type: aws_s3
+    inputs: [universal_tagging]
+    bucket: "raw-events"
+    endpoint: "http://ulpf-storage-lake:9000"
+    force_path_style: true
+    region: "us-east-1"
+    auth:
+      access_key_id: "admin"
+      secret_access_key: "sai12345"
+    encoding:
+      codec: json
+    compression: gzip
+    key_prefix: "date=%Y-%m-%d/"
+
+  redpanda_normalized_stream:
+    type: kafka
+    inputs: [traffic_cop.structured]
+    bootstrap_servers: "ulpf-streaming-bus:9092"
+    topic: "ocsf-events"
+    encoding:
+      codec: json
+
+  clickhouse_analytics:
+    type: clickhouse
+    inputs: [traffic_cop.structured]
+    endpoint: "http://ulpf-clickhouse:8123"
+    database: "admin"
+    table: "ocsf_events"
+    auth:
+      strategy: basic
+      user: "admin"
+      password: "sai12345"
+    encoding:
+      timestamp_format: rfc3339
+
+  redpanda_quarantine_stream:
+    type: kafka
+    inputs: [traffic_cop.quarantine]
+    bootstrap_servers: "ulpf-streaming-bus:9092"
+    topic: "quarantine-events"
+    encoding:
+      codec: json

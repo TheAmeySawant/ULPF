@@ -1,0 +1,30 @@
+# Security & Environment Credentials
+.env
+*.env
+*.pem
+*.key
+
+# Vector Engine (Ignores full Vector source tree, keeps only custom configs)
+vector/*
+!vector/custom_parsers/
+vector/custom_parsers/_sources_registry.state
+
+# Rust Build Artifacts (ulpf-parquet-worker)
+ulpf-parquet-worker/target/
+**/target/
+
+# Python Cache & Virtual Environments (ui)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# OS & Editor Metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+harbor/harbor/common/config/
+harbor/

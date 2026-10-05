@@ -1,0 +1,16 @@
+[package]
+name = "ulpf-parquet-worker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.35", features = ["full"] }
+rdkafka = { version = "0.36", features = ["cmake-build"] }
+arrow = "50.0"
+arrow-json = "50.0"
+parquet = { version = "50.0", features = ["arrow", "async"] }
+object_store = { version = "0.9", features = ["aws"] }
+serde_json = "1.0"
+uuid = { version = "1.7", features = ["v4"] }
+chrono = "=0.4.31"
+bytes = "1.5"

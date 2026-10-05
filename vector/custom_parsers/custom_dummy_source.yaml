@@ -1,0 +1,32 @@
+sources:
+  src_dummy_webhook:
+    type: http_server
+    address: "0.0.0.0:8080"
+    decoding:
+      codec: json
+
+transforms:
+  map_dummy:
+    type: remap
+    inputs: [src_dummy_webhook]
+    source: |-
+      .ulpf.event_uuid = uuid_v4()
+      .ulpf.ingestion_timestamp = now()
+      .ulpf.normalization_status = "FULL"
+      .schema_version = "1.0.0"
+      .class_name = "Application Activity"
+      .class_uid = 4001
+      
+      # Hardcoded field mappings for our test JSON
+      .metadata.product.name = string!(.app_name)
+      .activity_id = to_int!(.error_code)
+      .src_endpoint.ip = string!(.customer_ip)
+
+sinks:
+  sink_dummy:
+    type: kafka
+    inputs: [map_dummy]
+    bootstrap_servers: "ulpf-streaming-bus:9092"
+    topic: "ocsf-events"
+    encoding:
+      codec: json

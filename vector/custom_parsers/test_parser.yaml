@@ -1,0 +1,39 @@
+sources:
+  dummy_logs:
+    type: demo_logs
+    format: syslog
+    interval: 1.0
+
+transforms:
+  # 1. Parse standard Syslog
+  parse_standard:
+    type: remap
+    inputs: [dummy_logs]
+    source: |
+      . = parse_syslog!(.message)
+      .log_type = "standard_syslog"
+
+  # 2. Simulate and parse a proprietary format
+  parse_proprietary:
+    type: remap
+    inputs: [parse_standard]
+    source: |
+      # Simulating a proprietary pipe-delimited log payload
+      custom_payload = "AUTH_FAIL|192.168.1.50|invalid_token|42"
+
+      # Splitting the string natively in VRL
+      parts = split(custom_payload, "|")
+
+      # Structuring into OCSF-like taxonomy
+      .custom_auth = {}
+      .custom_auth.action = parts[0]
+      .custom_auth.src_ip = parts[1]
+      .custom_auth.reason = parts[2]
+      .custom_auth.attempts = to_int!(parts[3])
+
+sinks:
+  console_out:
+    type: console
+    inputs: [parse_proprietary]
+    encoding:
+      codec: json
